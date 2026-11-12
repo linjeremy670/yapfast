@@ -2,60 +2,268 @@ name: Sync Upstream & Build Windows
 
 on:
   schedule:
-    # Checks upstream every 6 hours
     - cron: '0 */6 * * *'
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: Build even if the current commit was already released
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  actions: write
+
+concurrency:
+  group: yapfast-sync-windows
+  cancel-in-progress: false
 
 jobs:
-  sync-and-build:
-    runs-on: windows-latest
+  sync:
+    runs-on: windows-2025
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      sha: ${{ steps.check.outputs.sha }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
 
-      - name: Sync with yapfast/yapfast main
+      - name: Sync upstream without rewriting fork history
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
           git remote add upstream https://github.com/yapfast/yapfast.git
           git fetch upstream main
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream fetch failed' }
 
-          git checkout main
-          git rebase upstream/main
-          git push origin main
+          $before = (git rev-parse HEAD).Trim()
+          git merge --no-edit upstream/main
+          if ($LASTEXITCODE -ne 0) { throw 'Upstream merge failed' }
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+          $after = (git rev-parse HEAD).Trim()
+          if ($before -eq $after) {
+            Write-Host 'Upstream is already in sync.'
+            exit 0
+          }
 
-      - name: Cache Cargo dependencies
-        uses: Swatinem/rust-cache@v2
+          git push origin HEAD:main
+          if ($LASTEXITCODE -ne 0) { throw 'Pushing the merge failed' }
+          Write-Host "Synced $before -> $after"
 
-      - name: Install LLVM/Clang (for WebRTC & Skia bindings)
-        run: choco install llvm -y
-
-      - name: Expose LIBCLANG_PATH
+      - name: Check for a successful build of this commit
+        id: check
         shell: pwsh
-        run: echo "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          $sha = (git rev-parse HEAD).Trim()
+          $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not read GitHub releases' }
 
-      - name: Build Windows release binary
-        run: cargo build --release --locked
+          $previous = $tags |
+            Where-Object { $_ -match '^windows-[0-9a-f]{40}-\d+-\d+$' } |
+            Select-Object -First 1
 
-      - name: Package Windows build
+          $released = $false
+          if ($previous -and $previous.StartsWith("windows-$sha-")) {
+            $asset = gh release view $previous --json assets `
+              --jq '[.assets[].name] | index("yapfast-windows-x64.exe") != null'
+            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the release' }
+            $released = $asset.Trim() -eq 'true'
+          }
+
+          $build = (-not $released) -or ($env:FORCE_BUILD -eq 'true')
+          "should_build=$($build.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+          "sha=$sha" >> $env:GITHUB_OUTPUT
+          Write-Host "Commit: $sha; Released: $released; Build: $build"
+
+  build:
+    needs: sync
+    if: needs.sync.outputs.should_build == 'true'
+    runs-on: windows-2025
+    env:
+      GH_TOKEN: ${{ github.token }}
+      BUILD_SHA: ${{ needs.sync.outputs.sha }}
+
+    steps:
+      - name: Checkout exact synced commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Install project-pinned Rust toolchain
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist
-          Copy-Item target/release/yapfast.exe dist/yapfast.exe
+          rustup show active-toolchain
+          if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain setup failed' }
 
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+      - name: Restore Cargo build cache
+        uses: Swatinem/rust-cache@v2
         with:
-          name: yapfast-windows-x64
-          path: dist/yapfast.exe
-          retention-days: 14
+          shared-key: windows-release
+          cache-on-failure: true
+
+      - name: Use bundled LLVM (install only as fallback)
+        shell: pwsh
+        run: |
+          $llvm = 'C:\Program Files\LLVM\bin'
+          if (-not (Test-Path (Join-Path $llvm 'libclang.dll'))) {
+            choco install llvm -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw 'LLVM install failed' }
+          }
+          if (-not (Test-Path (Join-Path $llvm 'libclang.dll'))) {
+            throw 'libclang.dll was not found'
+          }
+          "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
+          "LLVM_HOME=C:\Program Files\LLVM" >> $env:GITHUB_ENV
+          $llvm >> $env:GITHUB_PATH
+
+      - name: Ensure NASM is available
+        shell: pwsh
+        run: |
+          if (Get-Command nasm -ErrorAction SilentlyContinue) { exit 0 }
+          choco install nasm -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw 'NASM installation failed' }
+          foreach ($dir in @('C:\Program Files\NASM', 'C:\Program Files (x86)\NASM')) {
+            if (Test-Path (Join-Path $dir 'nasm.exe')) {
+              $dir >> $env:GITHUB_PATH
+              exit 0
+            }
+          }
+          throw 'NASM was installed but nasm.exe could not be located'
+
+      - name: Restore prepared Windows Skia archive
+        uses: actions/cache@v4
+        with:
+          path: .local/windows/skia/prepared
+          key: windows-skia-${{ hashFiles('scripts/prepare-windows-skia.py', 'nix/prepare-skia-native.py', 'nix/skia-windows-builder/Cargo.lock') }}
+
+      - name: Prepare Skia when not cached
+        shell: pwsh
+        run: |
+          $assignment = (python scripts/prepare-windows-skia.py --print-env)
+          if ($LASTEXITCODE -ne 0) { throw 'Could not determine Skia archive URL' }
+          if ($assignment -notmatch '^\$env:SKIA_BINARIES_URL = ''([^'']+)''$') {
+            throw 'Unexpected Skia environment output'
+          }
+          $archiveUrl = $Matches[1]
+          $archivePath = $archiveUrl.Replace('file://', '')
+          if (-not (Test-Path $archivePath)) {
+            python scripts/prepare-windows-skia.py
+            if ($LASTEXITCODE -ne 0) { throw 'Skia preparation failed' }
+          }
+          if (-not (Test-Path $archivePath)) { throw 'Skia archive is missing' }
+          "SKIA_BINARIES_URL=$archiveUrl" >> $env:GITHUB_ENV
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package executable and checksum
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/yapfast.exe dist/yapfast-windows-x64.exe
+          $hash = (Get-FileHash dist/yapfast-windows-x64.exe -Algorithm SHA256).Hash
+          "$($hash.ToLowerInvariant())  yapfast-windows-x64.exe" |
+            Set-Content dist/SHA256SUMS -Encoding utf8
+
+      - name: Publish GitHub Release and commit changelog
+        id: publish
+        shell: pwsh
+        run: |
+          git fetch origin --tags
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch release tags' }
+
+          $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not find previous releases' }
+          $previous = $tags |
+            Where-Object { $_ -match '^windows-[0-9a-f]{40}-\d+-\d+$' } |
+            Select-Object -First 1
+
+          if ($previous) {
+            $changes = @(git log -n 60 --format='- %h %s' "$previous..HEAD")
+          } else {
+            $changes = @(git log -n 30 --format='- %h %s')
+          }
+          if ($LASTEXITCODE -ne 0) { throw 'Failed to generate changelog' }
+          if (-not $changes) { $changes = @('- Rebuilt the same commit.') }
+
+          $notes = @(
+            "Windows x64 build for commit $env:BUILD_SHA",
+            '', '## Changes since previous successful build', ''
+          ) + $changes
+          $notes | Set-Content release-notes.md -Encoding utf8
+
+          $tag = "windows-$env:BUILD_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          gh release create $tag dist/yapfast-windows-x64.exe dist/SHA256SUMS `
+            --target $env:BUILD_SHA `
+            --title "Yapfast Windows dev build $($env:BUILD_SHA.Substring(0, 8))" `
+            --notes-file release-notes.md `
+            --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'Release publishing failed' }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "### Windows release: $tag" >> $env:GITHUB_STEP_SUMMARY
+          $changes | Select-Object -First 15 |
+            Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Remove older Windows binaries and legacy Actions artifacts
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CURRENT_TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list releases for cleanup' }
+
+          foreach ($tag in $tags) {
+            if ($tag -notmatch '^windows-[0-9a-f]{40}-\d+-\d+$') { continue }
+            if ($tag -eq $env:CURRENT_TAG) { continue }
+            $assets = @(gh release view $tag --json assets --jq '.assets[].name')
+            if ($LASTEXITCODE -ne 0) { continue }
+            foreach ($name in @('yapfast-windows-x64.exe', 'SHA256SUMS')) {
+              if ($name -notin $assets) { continue }
+              gh release delete-asset $tag $name --yes
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Could not prune $name from $tag"
+              }
+            }
+          }
+
+          $ids = @(gh api --paginate `
+            "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100" `
+            --jq '.artifacts[] | select(.name == "yapfast-windows-x64") | .id')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list legacy artifacts' }
+          foreach ($id in $ids) {
+            gh api -X DELETE "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$id"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Could not delete artifact $id" }
+          }
+
+      - name: Notify Discord of build result
+        if: always()
+        shell: pwsh
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          if (-not $env:DISCORD_WEBHOOK_URL) { exit 0 }
+          $success = '${{ job.status }}' -eq 'success'
+          $status = if ($success) { 'SUCCESS' } else { 'FAILED' }
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          if ($success -and $env:RELEASE_TAG) {
+            $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG"
+          }
+          $message = "Yapfast Windows build **$status** for ``$($env:BUILD_SHA.Substring(0, 8))``: $url"
+          $body = @{ content = $message } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK_URL -Method Post `
+              -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
+          } catch {
+            Write-Warning 'Discord notification failed.'
+          }
