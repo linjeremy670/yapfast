@@ -130,11 +130,19 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain setup failed' }
 
       - name: Restore Cargo build cache
+        id: cargo_cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-release
           key: windows-latest
           cache-on-failure: true
+
+      - name: Restore cached LLVM 21 installation
+        id: llvm_cache
+        uses: actions/cache@v5
+        with:
+          path: C:\Program Files\LLVM
+          key: windows-llvm-21.1.7-v1-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install LLVM 21 for Skia symbol isolation
         shell: pwsh
@@ -177,6 +185,7 @@ jobs:
           throw 'NASM was installed but nasm.exe could not be located'
 
       - name: Restore prepared Windows Skia archive
+        id: skia_cache
         uses: actions/cache@v5
         with:
           path: .local/windows/skia/prepared
@@ -208,7 +217,15 @@ jobs:
           "SKIA_BINARIES_URL=$archiveUrl" >> $env:GITHUB_ENV
 
       - name: Build release binary
-        run: cargo build --release --locked
+        id: cargo_build
+        shell: pwsh
+        run: |
+          $started = [DateTime]::UtcNow
+          cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
+          $seconds = [int]([DateTime]::UtcNow - $started).TotalSeconds
+          "seconds=$seconds" >> $env:GITHUB_OUTPUT
+          "### Cargo compilation: $seconds seconds" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Package executable and checksum
         shell: pwsh
@@ -262,6 +279,105 @@ jobs:
             "Windows x64 build for commit $env:BUILD_SHA",
             '', '## Changes since previous successful build', ''
           ) + $changes
+          $cargoSeconds = [int]'${{ steps.cargo_build.outputs.seconds }}'
+          $referenceSeconds = 1726
+          $referenceLabel = 'initial cold build (12 November 2026)'
+          if ($previous) {
+            $previousBody = (gh release view $previous --json body --jq '.body' | Out-String)
+            if ($LASTEXITCODE -eq 0 -and $previousBody -match '(?m)^- Cargo compilation: ([0-9]+) s
+
+          $tag = "windows-$env:BUILD_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          gh release create $tag dist/yapfast-windows-x64.exe dist/SHA256SUMS `
+            --target $env:BUILD_SHA `
+            --title "Yapfast Windows dev build $($env:BUILD_SHA.Substring(0, 8))" `
+            --notes-file release-notes.md `
+            --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'Release publishing failed' }
+
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          "### Windows release: $tag" >> $env:GITHUB_STEP_SUMMARY
+          $changes | Select-Object -First 15 |
+            Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+
+      - name: Retain three recent Windows binaries and prune legacy Actions artifacts
+        continue-on-error: true
+        shell: pwsh
+        env:
+          CURRENT_TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list releases for cleanup' }
+          $windowsTags = @($tags | Where-Object { $_ -match '^windows-[0-9a-f]{40}-\d+-\d+$' })
+          $retained = @($windowsTags | Select-Object -First 3)
+          if ($env:CURRENT_TAG -and $env:CURRENT_TAG -notin $retained) {
+            $retained += $env:CURRENT_TAG
+          }
+
+          foreach ($tag in $windowsTags) {
+            if ($tag -in $retained) { continue }
+            $assets = @(gh release view $tag --json assets --jq '.assets[].name')
+            if ($LASTEXITCODE -ne 0) { continue }
+            foreach ($name in @('yapfast-windows-x64.exe', 'SHA256SUMS')) {
+              if ($name -notin $assets) { continue }
+              gh release delete-asset $tag $name --yes
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Could not prune $name from $tag"
+              }
+            }
+          }
+
+          $ids = @(gh api --paginate `
+            "repos/$env:YAPFAST_REPOSITORY/actions/artifacts?per_page=100" `
+            --jq '.artifacts[] | select(.name == "yapfast-windows-x64") | .id')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list legacy artifacts' }
+          foreach ($id in $ids) {
+            gh api -X DELETE "repos/$env:YAPFAST_REPOSITORY/actions/artifacts/$id"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Could not delete artifact $id" }
+          }
+
+      - name: Notify Discord of build result
+        if: always()
+        shell: pwsh
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          if (-not $env:DISCORD_WEBHOOK_URL) { exit 0 }
+          $success = '${{ job.status }}' -eq 'success'
+          $status = if ($success) { 'SUCCESS' } else { 'FAILED' }
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          if ($success -and $env:RELEASE_TAG) {
+            $url = "https://github.com/$env:YAPFAST_REPOSITORY/releases/tag/$env:RELEASE_TAG"
+          }
+          $message = "Yapfast Windows build **$status** for ``$($env:BUILD_SHA.Substring(0, 8))``: $url"
+          $body = @{ content = $message } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK_URL -Method Post `
+              -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
+          } catch {
+            Write-Warning 'Discord notification failed.'
+          }
+) {
+              $referenceSeconds = [int]$Matches[1]
+              $referenceLabel = "previous Windows release ($previous)"
+            }
+          }
+          $savedSeconds = $referenceSeconds - $cargoSeconds
+          $savedPercent = [math]::Round(100 * $savedSeconds / $referenceSeconds, 1)
+          $rustVersion = (rustc --version | Out-String).Trim()
+          $binaryHash = (Get-FileHash dist/yapfast-windows-x64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $diagnostics = @(
+            '', '## Build diagnostics', '',
+            "- Cargo compilation: $cargoSeconds s",
+            "- Comparison: $referenceSeconds s ($referenceLabel)",
+            "- Time saved: $savedSeconds s ($savedPercent percent)",
+            "- Skia cache hit: ${{ steps.skia_cache.outputs.cache-hit }}",
+            "- Cargo cache hit: ${{ steps.cargo_cache.outputs.cache-hit }}",
+            "- LLVM cache hit: ${{ steps.llvm_cache.outputs.cache-hit }}",
+            "- Rust compiler: $rustVersion",
+            "- Executable SHA256: $binaryHash"
+          )
+          $notes += $diagnostics
           $notes | Set-Content release-notes.md -Encoding utf8
 
           $tag = "windows-$env:BUILD_SHA-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
