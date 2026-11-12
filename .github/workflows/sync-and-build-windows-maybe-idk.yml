@@ -36,7 +36,7 @@ jobs:
       sha: ${{ steps.check.outputs.sha }}
     steps:
       - name: Checkout fork
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: linjeremy670/yapfast
           ref: automation/windows-build
@@ -116,7 +116,7 @@ jobs:
 
     steps:
       - name: Checkout exact synced commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: linjeremy670/yapfast
           token: ${{ secrets.YAPFAST_TOKEN }}
@@ -177,7 +177,7 @@ jobs:
           throw 'NASM was installed but nasm.exe could not be located'
 
       - name: Restore prepared Windows Skia archive
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .local/windows/skia/prepared
           key: windows-skia-v2-${{ hashFiles('scripts/prepare-windows-skia.py', 'nix/prepare-skia-native.py', 'nix/skia-windows-builder/Cargo.lock', 'nix/skia-windows-builder/Cargo.toml', 'rust-toolchain.toml') }}
