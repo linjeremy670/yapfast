@@ -40,19 +40,31 @@ jobs:
           git fetch upstream main
           if ($LASTEXITCODE -ne 0) { throw 'Upstream fetch failed' }
 
-          $before = (git rev-parse HEAD).Trim()
-          git merge --no-edit upstream/main
-          if ($LASTEXITCODE -ne 0) { throw 'Upstream merge failed' }
+          # Reruns may check out an older workflow SHA. Always start from live main.
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            git fetch origin main
+            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch fork main' }
+            git checkout -B main origin/main
+            if ($LASTEXITCODE -ne 0) { throw 'Could not refresh fork main' }
 
-          $after = (git rev-parse HEAD).Trim()
-          if ($before -eq $after) {
-            Write-Host 'Upstream is already in sync.'
-            exit 0
+            $before = (git rev-parse HEAD).Trim()
+            git merge --no-edit upstream/main
+            if ($LASTEXITCODE -ne 0) { throw 'Upstream merge failed' }
+
+            $after = (git rev-parse HEAD).Trim()
+            if ($before -eq $after) {
+              Write-Host 'Upstream is already in sync.'
+              break
+            }
+
+            git push origin HEAD:main
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "Synced $before -> $after"
+              break
+            }
+            if ($attempt -eq 3) { throw 'Fork main advanced during all three push attempts' }
+            Write-Warning "Push raced with another update; retrying ($attempt/3)."
           }
-
-          git push origin HEAD:main
-          if ($LASTEXITCODE -ne 0) { throw 'Pushing the merge failed' }
-          Write-Host "Synced $before -> $after"
 
       - name: Check for a successful build of this commit
         id: check
@@ -65,16 +77,16 @@ jobs:
           $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
           if ($LASTEXITCODE -ne 0) { throw 'Could not read GitHub releases' }
 
-          $previous = $tags |
-            Where-Object { $_ -match '^windows-[0-9a-f]{40}-\d+-\d+$' } |
-            Select-Object -First 1
-
+          $matching = @($tags | Where-Object { $_ -match "^windows-$sha-\d+-\d+$" })
           $released = $false
-          if ($previous -and $previous.StartsWith("windows-$sha-")) {
-            $asset = gh release view $previous --json assets `
+          foreach ($tag in $matching) {
+            $asset = gh release view $tag --json assets `
               --jq '[.assets[].name] | index("yapfast-windows-x64.exe") != null'
-            if ($LASTEXITCODE -ne 0) { throw 'Could not inspect the release' }
-            $released = $asset.Trim() -eq 'true'
+            if ($LASTEXITCODE -ne 0) { throw "Could not inspect release $tag" }
+            if ($asset.Trim() -eq 'true') {
+              $released = $true
+              break
+            }
           }
 
           $build = (-not $released) -or ($env:FORCE_BUILD -eq 'true')
@@ -107,6 +119,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-release
+          key: windows-2025
           cache-on-failure: true
 
       - name: Use bundled LLVM (install only as fallback)
@@ -142,7 +155,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .local/windows/skia/prepared
-          key: windows-skia-${{ hashFiles('scripts/prepare-windows-skia.py', 'nix/prepare-skia-native.py', 'nix/skia-windows-builder/Cargo.lock') }}
+          key: windows-skia-v2-${{ hashFiles('scripts/prepare-windows-skia.py', 'nix/prepare-skia-native.py', 'nix/skia-windows-builder/Cargo.lock', 'nix/skia-windows-builder/Cargo.toml', 'rust-toolchain.toml') }}
 
       - name: Prepare Skia when not cached
         shell: pwsh
@@ -154,6 +167,14 @@ jobs:
           }
           $archiveUrl = $Matches[1]
           $archivePath = $archiveUrl.Replace('file://', '')
+          if (Test-Path $archivePath) {
+            # Check that the restored gzip and all tar members can be read.
+            python -c "import sys,tarfile; t=tarfile.open(sys.argv[1], 'r:gz'); [f.read() for m in t if m.isfile() for f in [t.extractfile(m)] if f is not None]; t.close()" $archivePath
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning 'Cached Skia archive is corrupt; rebuilding.'
+              Remove-Item $archivePath -Force
+            }
+          }
           if (-not (Test-Path $archivePath)) {
             python scripts/prepare-windows-skia.py
             if ($LASTEXITCODE -ne 0) { throw 'Skia preparation failed' }
@@ -213,7 +234,7 @@ jobs:
           $changes | Select-Object -First 15 |
             Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Remove older Windows binaries and legacy Actions artifacts
+      - name: Retain three recent Windows binaries and prune legacy Actions artifacts
         continue-on-error: true
         shell: pwsh
         env:
@@ -222,9 +243,52 @@ jobs:
           $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
           if ($LASTEXITCODE -ne 0) { throw 'Could not list releases for cleanup' }
 
-          foreach ($tag in $tags) {
-            if ($tag -notmatch '^windows-[0-9a-f]{40}-\d+-\d+$') { continue }
-            if ($tag -eq $env:CURRENT_TAG) { continue }
+          $windowsTags = @($tags | Where-Object { $_ -match '^windows-[0-9a-f]{40}-\d+-\d+
+            if ($LASTEXITCODE -ne 0) { continue }
+            foreach ($name in @('yapfast-windows-x64.exe', 'SHA256SUMS')) {
+              if ($name -notin $assets) { continue }
+              gh release delete-asset $tag $name --yes
+              if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Could not prune $name from $tag"
+              }
+            }
+          }
+
+          $ids = @(gh api --paginate `
+            "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100" `
+            --jq '.artifacts[] | select(.name == "yapfast-windows-x64") | .id')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list legacy artifacts' }
+          foreach ($id in $ids) {
+            gh api -X DELETE "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$id"
+            if ($LASTEXITCODE -ne 0) { Write-Warning "Could not delete artifact $id" }
+          }
+
+      - name: Notify Discord of build result
+        if: always()
+        shell: pwsh
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RELEASE_TAG: ${{ steps.publish.outputs.tag }}
+        run: |
+          if (-not $env:DISCORD_WEBHOOK_URL) { exit 0 }
+          $success = '${{ job.status }}' -eq 'success'
+          $status = if ($success) { 'SUCCESS' } else { 'FAILED' }
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          if ($success -and $env:RELEASE_TAG) {
+            $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG"
+          }
+          $message = "Yapfast Windows build **$status** for ``$($env:BUILD_SHA.Substring(0, 8))``: $url"
+          $body = @{ content = $message } | ConvertTo-Json -Compress
+          try {
+            Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK_URL -Method Post `
+              -ContentType 'application/json' -Body $body -TimeoutSec 10 | Out-Null
+          } catch {
+            Write-Warning 'Discord notification failed.'
+          }
+ })
+          $retained = @($windowsTags | Select-Object -First 3) + @($env:CURRENT_TAG)
+          foreach ($tag in $windowsTags) {
+            if ($tag -in $retained) { continue }
             $assets = @(gh release view $tag --json assets --jq '.assets[].name')
             if ($LASTEXITCODE -ne 0) { continue }
             foreach ($name in @('yapfast-windows-x64.exe', 'SHA256SUMS')) {
