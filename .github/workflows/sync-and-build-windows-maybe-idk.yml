@@ -115,7 +115,31 @@ jobs:
       BUILD_SHA: ${{ needs.sync.outputs.sha }}
 
     steps:
+      - name: Recheck for a release after the build queue
+        id: gate
+        shell: pwsh
+        env:
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          if ($env:FORCE_BUILD -eq 'true') {
+            "should_build=true" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot recheck releases' }
+          $matching = @($tags | Where-Object { $_ -like "windows-$env:BUILD_SHA-*" })
+          foreach ($tag in $matching) {
+            $assets = @(gh release view $tag --json assets --jq '.assets[].name')
+            if ($LASTEXITCODE -ne 0) { throw "Cannot inspect release $tag" }
+            if ('yapfast-windows-x64.exe' -in $assets -and 'SHA256SUMS' -in $assets) {
+              Write-Host "Commit $env:BUILD_SHA already released as $tag. Skipping duplicate build."
+              "should_build=false" >> $env:GITHUB_OUTPUT
+              exit 0
+            }
+          }
+          "should_build=true" >> $env:GITHUB_OUTPUT
       - name: Checkout exact synced commit
+        if: steps.gate.outputs.should_build == 'true'
         uses: actions/checkout@v5
         with:
           repository: linjeremy670/yapfast
@@ -124,12 +148,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install project-pinned Rust toolchain
+        if: steps.gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           rustup show active-toolchain
           if ($LASTEXITCODE -ne 0) { throw 'Rust toolchain setup failed' }
 
       - name: Restore Cargo build cache
+        if: steps.gate.outputs.should_build == 'true'
         id: cargo_cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -138,6 +164,7 @@ jobs:
           cache-on-failure: true
 
       - name: Restore cached LLVM 21 installation
+        if: steps.gate.outputs.should_build == 'true'
         id: llvm_cache
         uses: actions/cache@v5
         with:
@@ -145,6 +172,7 @@ jobs:
           key: windows-llvm-21.1.7-v1-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install LLVM 21 for Skia symbol isolation
+        if: steps.gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           $llvmHome = 'C:\Program Files\LLVM'
@@ -171,6 +199,7 @@ jobs:
           $llvm >> $env:GITHUB_PATH
 
       - name: Ensure NASM is available
+        if: steps.gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           if (Get-Command nasm -ErrorAction SilentlyContinue) { exit 0 }
@@ -185,6 +214,7 @@ jobs:
           throw 'NASM was installed but nasm.exe could not be located'
 
       - name: Restore prepared Windows Skia archive
+        if: steps.gate.outputs.should_build == 'true'
         id: skia_cache
         uses: actions/cache@v5
         with:
@@ -192,6 +222,7 @@ jobs:
           key: windows-skia-v2-${{ hashFiles('scripts/prepare-windows-skia.py', 'nix/prepare-skia-native.py', 'nix/skia-windows-builder/Cargo.lock', 'nix/skia-windows-builder/Cargo.toml', 'rust-toolchain.toml') }}
 
       - name: Prepare Skia when not cached
+        if: steps.gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           $assignment = (python scripts/prepare-windows-skia.py --print-env)
@@ -217,6 +248,7 @@ jobs:
           "SKIA_BINARIES_URL=$archiveUrl" >> $env:GITHUB_ENV
 
       - name: Build release binary
+        if: steps.gate.outputs.should_build == 'true'
         id: cargo_build
         shell: pwsh
         run: |
@@ -228,6 +260,7 @@ jobs:
           "### Cargo compilation: $seconds seconds" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Package executable and checksum
+        if: steps.gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
@@ -237,6 +270,7 @@ jobs:
             Set-Content dist/SHA256SUMS -Encoding utf8
 
       - name: Verify packaged executable checksum
+        if: steps.gate.outputs.should_build == 'true'
         shell: pwsh
         run: |
           $exe = 'dist/yapfast-windows-x64.exe'
@@ -255,6 +289,7 @@ jobs:
           "### Verified Windows binary SHA256: $actual" >> $env:GITHUB_STEP_SUMMARY
 
       - name: Publish GitHub Release and commit changelog
+        if: steps.gate.outputs.should_build == 'true'
         id: publish
         shell: pwsh
         run: |
@@ -321,28 +356,40 @@ jobs:
             Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
       - name: Retain three recent Windows binaries and prune legacy Actions artifacts
+        if: steps.gate.outputs.should_build == 'true'
         continue-on-error: true
         shell: pwsh
         env:
           CURRENT_TAG: ${{ steps.publish.outputs.tag }}
         run: |
-          $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
+          $rows = @(gh api --paginate \
+            "repos/$env:YAPFAST_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | [.tag_name, .published_at, ([.assets[].name] | join(","))] | @tsv')
           if ($LASTEXITCODE -ne 0) { throw 'Could not list releases for cleanup' }
-          $windowsTags = @($tags | Where-Object { $_ -match '^windows-[0-9a-f]{40}-\d+-\d+$' })
-          $retained = @($windowsTags | Select-Object -First 3)
+          $complete = @(
+            foreach ($line in $rows) {
+              $fields = $line -split "`t", 3
+              if ($fields.Count -ne 3 -or $fields[0] -notmatch '^windows-[0-9a-f]{40}-[0-9]+-[0-9]+$') { continue }
+              $assets = @($fields[2] -split ',')
+              if ('yapfast-windows-x64.exe' -notin $assets -or 'SHA256SUMS' -notin $assets) { continue }
+              [pscustomobject]@{
+                Tag = $fields[0]
+                Published = [DateTimeOffset]::Parse($fields[1])
+              }
+            }
+          )
+          $complete = @($complete | Sort-Object Published -Descending)
+          $retained = @($complete | Select-Object -First 3 | ForEach-Object { $_.Tag })
           if ($env:CURRENT_TAG -and $env:CURRENT_TAG -notin $retained) {
-            $retained += $env:CURRENT_TAG
+            $retained = @($env:CURRENT_TAG) + @($retained | Select-Object -First 2)
           }
-
-          foreach ($tag in $windowsTags) {
-            if ($tag -in $retained) { continue }
-            $assets = @(gh release view $tag --json assets --jq '.assets[].name')
-            if ($LASTEXITCODE -ne 0) { continue }
-            foreach ($name in @('yapfast-windows-x64.exe', 'SHA256SUMS')) {
-              if ($name -notin $assets) { continue }
-              gh release delete-asset $tag $name --yes
+          Write-Host "Retaining complete Windows releases: $($retained -join ', ')"
+          foreach ($release in $complete) {
+            if ($release.Tag -in $retained) { continue }
+            foreach ($asset in @('yapfast-windows-x64.exe', 'SHA256SUMS')) {
+              gh release delete-asset $release.Tag $asset --yes
               if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Could not prune $name from $tag"
+                Write-Warning "Could not prune $asset from $($release.Tag)"
               }
             }
           }
@@ -357,20 +404,29 @@ jobs:
           }
 
       - name: Notify Discord of build result
-        if: always()
+        if: always() && (steps.gate.outputs.should_build == 'true' || failure())
         shell: pwsh
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RELEASE_TAG: ${{ steps.publish.outputs.tag }}
         run: |
-          if (-not $env:DISCORD_WEBHOOK_URL) { exit 0 }
+          if (-not $env:DISCORD_WEBHOOK_URL) {
+            Write-Host 'Discord webhook is not configured; notification skipped.'
+            exit 0
+          }
           $success = '${{ job.status }}' -eq 'success'
           $status = if ($success) { 'SUCCESS' } else { 'FAILED' }
           $url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           if ($success -and $env:RELEASE_TAG) {
             $url = "https://github.com/$env:YAPFAST_REPOSITORY/releases/tag/$env:RELEASE_TAG"
           }
-          $message = "Yapfast Windows build **$status** for ``$($env:BUILD_SHA.Substring(0, 8))``: $url"
+          $cargoSeconds = '${{ steps.cargo_build.outputs.seconds }}'
+          $skiaHit = '${{ steps.skia_cache.outputs.cache-hit }}'
+          $llvmHit = '${{ steps.llvm_cache.outputs.cache-hit }}'
+          $metrics = if ($cargoSeconds) {
+            " | Cargo: ${cargoSeconds}s | Skia cache: $skiaHit | LLVM cache: $llvmHit"
+          } else { '' }
+          $message = "Yapfast Windows build **$status** for ``$($env:BUILD_SHA.Substring(0, 8))``: $url$metrics"
           $body = @{ content = $message } | ConvertTo-Json -Compress
           try {
             Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK_URL -Method Post `
