@@ -29,6 +29,9 @@ concurrency:
 jobs:
   sync:
     runs-on: windows-2025
+    env:
+      GH_REPO: linjeremy670/yapfast
+      YAPFAST_REPOSITORY: linjeremy670/yapfast
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       sha: ${{ steps.check.outputs.sha }}
@@ -36,6 +39,7 @@ jobs:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
+          repository: linjeremy670/yapfast
           ref: automation/windows-build
           token: ${{ secrets.YAPFAST_TOKEN }}
           fetch-depth: 0
@@ -45,7 +49,7 @@ jobs:
         env:
           YAPFAST_TOKEN: ${{ secrets.YAPFAST_TOKEN }}
         run: |
-          git remote set-url origin "https://x-access-token:$env:YAPFAST_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
+          git remote set-url origin "https://x-access-token:$env:YAPFAST_TOKEN@github.com/$env:YAPFAST_REPOSITORY.git"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/yapfast/yapfast.git
@@ -111,6 +115,8 @@ jobs:
     if: needs.sync.outputs.should_build == 'true'
     runs-on: windows-2025
     env:
+      GH_REPO: linjeremy670/yapfast
+      YAPFAST_REPOSITORY: linjeremy670/yapfast
       GH_TOKEN: ${{ secrets.YAPFAST_TOKEN }}
       BUILD_SHA: ${{ needs.sync.outputs.sha }}
 
@@ -118,6 +124,8 @@ jobs:
       - name: Checkout exact synced commit
         uses: actions/checkout@v4
         with:
+          repository: linjeremy670/yapfast
+          token: ${{ secrets.YAPFAST_TOKEN }}
           ref: ${{ needs.sync.outputs.sha }}
           fetch-depth: 0
 
@@ -278,11 +286,11 @@ jobs:
           }
 
           $ids = @(gh api --paginate `
-            "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100" `
+            "repos/$env:YAPFAST_REPOSITORY/actions/artifacts?per_page=100" `
             --jq '.artifacts[] | select(.name == "yapfast-windows-x64") | .id')
           if ($LASTEXITCODE -ne 0) { throw 'Could not list legacy artifacts' }
           foreach ($id in $ids) {
-            gh api -X DELETE "repos/$env:GITHUB_REPOSITORY/actions/artifacts/$id"
+            gh api -X DELETE "repos/$env:YAPFAST_REPOSITORY/actions/artifacts/$id"
             if ($LASTEXITCODE -ne 0) { Write-Warning "Could not delete artifact $id" }
           }
 
@@ -298,7 +306,7 @@ jobs:
           $status = if ($success) { 'SUCCESS' } else { 'FAILED' }
           $url = "https://github.com/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
           if ($success -and $env:RELEASE_TAG) {
-            $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/tag/$env:RELEASE_TAG"
+            $url = "https://github.com/$env:YAPFAST_REPOSITORY/releases/tag/$env:RELEASE_TAG"
           }
           $message = "Yapfast Windows build **$status** for ``$($env:BUILD_SHA.Substring(0, 8))``: $url"
           $body = @{ content = $message } | ConvertTo-Json -Compress
