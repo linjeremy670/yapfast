@@ -1,8 +1,7 @@
 name: Sync Upstream & Build Windows
 
 on:
-  schedule:
-    - cron: '0 */6 * * *'
+  workflow_call:
   workflow_dispatch:
     inputs:
       force_build:
@@ -28,7 +27,7 @@ jobs:
       - name: Checkout fork
         uses: actions/checkout@v4
         with:
-          ref: main
+          ref: automation/windows-build
           fetch-depth: 0
 
       - name: Sync upstream without rewriting fork history
@@ -40,12 +39,12 @@ jobs:
           git fetch upstream main
           if ($LASTEXITCODE -ne 0) { throw 'Upstream fetch failed' }
 
-          # Reruns may check out an older workflow SHA. Always start from live main.
+          # Keep the default branch byte-for-byte identical to upstream.
           for ($attempt = 1; $attempt -le 3; $attempt++) {
-            git fetch origin main
-            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch fork main' }
-            git checkout -B main origin/main
-            if ($LASTEXITCODE -ne 0) { throw 'Could not refresh fork main' }
+            git fetch origin automation/windows-build
+            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch automation branch' }
+            git checkout -B automation/windows-build origin/automation/windows-build
+            if ($LASTEXITCODE -ne 0) { throw 'Could not refresh automation branch' }
 
             $before = (git rev-parse HEAD).Trim()
             git merge --no-edit upstream/main
@@ -57,12 +56,12 @@ jobs:
               break
             }
 
-            git push origin HEAD:main
+            git push origin HEAD:automation/windows-build
             if ($LASTEXITCODE -eq 0) {
               Write-Host "Synced $before -> $after"
               break
             }
-            if ($attempt -eq 3) { throw 'Fork main advanced during all three push attempts' }
+            if ($attempt -eq 3) { throw 'Automation branch advanced during all three push attempts' }
             Write-Warning "Push raced with another update; retrying ($attempt/3)."
           }
 
@@ -122,19 +121,30 @@ jobs:
           key: windows-2025
           cache-on-failure: true
 
-      - name: Use bundled LLVM (install only as fallback)
+      - name: Install LLVM 21 for Skia symbol isolation
         shell: pwsh
         run: |
-          $llvm = 'C:\Program Files\LLVM\bin'
-          if (-not (Test-Path (Join-Path $llvm 'libclang.dll'))) {
-            choco install llvm -y --no-progress
-            if ($LASTEXITCODE -ne 0) { throw 'LLVM install failed' }
+          $llvmHome = 'C:\Program Files\LLVM'
+          $llvm = Join-Path $llvmHome 'bin'
+          $objcopy = Join-Path $llvm 'llvm-objcopy.exe'
+          $major = 0
+          if (Test-Path $objcopy) {
+            $version = (& $objcopy --version | Out-String)
+            if ($version -match 'LLVM version (\d+)') { $major = [int]$Matches[1] }
+          }
+          if ($major -lt 21) {
+            choco upgrade llvm --version=21.1.7 -y --no-progress --allow-downgrade
+            if ($LASTEXITCODE -ne 0) { throw 'LLVM 21 installation failed' }
+          }
+          $version = (& $objcopy --version | Out-String)
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch 'LLVM version (2[1-9]|[3-9]\d+)') {
+            throw "Skia needs LLVM >= 21; found: $version"
           }
           if (-not (Test-Path (Join-Path $llvm 'libclang.dll'))) {
             throw 'libclang.dll was not found'
           }
           "LIBCLANG_PATH=$llvm" >> $env:GITHUB_ENV
-          "LLVM_HOME=C:\Program Files\LLVM" >> $env:GITHUB_ENV
+          "LLVM_HOME=$llvmHome" >> $env:GITHUB_ENV
           $llvm >> $env:GITHUB_PATH
 
       - name: Ensure NASM is available
