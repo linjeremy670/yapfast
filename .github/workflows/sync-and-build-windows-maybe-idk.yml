@@ -19,8 +19,7 @@ on:
         default: false
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 concurrency:
   group: yapfast-sync-windows
@@ -44,42 +43,37 @@ jobs:
           token: ${{ secrets.YAPFAST_TOKEN }}
           fetch-depth: 0
 
-      - name: Sync upstream without rewriting fork history
+      - name: Fast-forward fork main to exact upstream commit
         shell: pwsh
         env:
           YAPFAST_TOKEN: ${{ secrets.YAPFAST_TOKEN }}
         run: |
           git remote set-url origin "https://x-access-token:$env:YAPFAST_TOKEN@github.com/$env:YAPFAST_REPOSITORY.git"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/yapfast/yapfast.git
           git fetch upstream main
           if ($LASTEXITCODE -ne 0) { throw 'Upstream fetch failed' }
 
-          # Keep the default branch byte-for-byte identical to upstream.
           for ($attempt = 1; $attempt -le 3; $attempt++) {
-            git fetch origin automation/windows-build
-            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch automation branch' }
-            git checkout -B automation/windows-build origin/automation/windows-build
-            if ($LASTEXITCODE -ne 0) { throw 'Could not refresh automation branch' }
+            git fetch origin main
+            if ($LASTEXITCODE -ne 0) { throw 'Could not fetch fork main' }
+            $upstreamSha = (git rev-parse upstream/main).Trim()
+            $forkSha = (git rev-parse origin/main).Trim()
 
-            $before = (git rev-parse HEAD).Trim()
-            git merge --no-edit upstream/main
-            if ($LASTEXITCODE -ne 0) { throw 'Upstream merge failed' }
-
-            $after = (git rev-parse HEAD).Trim()
-            if ($before -eq $after) {
-              Write-Host 'Upstream is already in sync.'
+            if ($upstreamSha -eq $forkSha) {
+              Write-Host "Fork main is already identical to upstream: $upstreamSha"
               break
             }
-
-            git push origin HEAD:automation/windows-build
+            git merge-base --is-ancestor origin/main upstream/main
+            if ($LASTEXITCODE -ne 0) {
+              throw 'Fork main diverged from upstream; refusing to rewrite history'
+            }
+            git push origin upstream/main:refs/heads/main
             if ($LASTEXITCODE -eq 0) {
-              Write-Host "Synced $before -> $after"
+              Write-Host "Fast-forwarded fork main $forkSha -> $upstreamSha"
               break
             }
-            if ($attempt -eq 3) { throw 'Automation branch advanced during all three push attempts' }
-            Write-Warning "Push raced with another update; retrying ($attempt/3)."
+            if ($attempt -eq 3) { throw 'Could not fast-forward fork main after three attempts' }
+            Write-Warning "Push raced; retrying ($attempt/3)."
           }
 
       - name: Check for a successful build of this commit
@@ -89,7 +83,7 @@ jobs:
           GH_TOKEN: ${{ secrets.YAPFAST_TOKEN }}
           FORCE_BUILD: ${{ inputs.force_build }}
         run: |
-          $sha = (git rev-parse HEAD).Trim()
+          $sha = (git rev-parse upstream/main).Trim()
           $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
           if ($LASTEXITCODE -ne 0) { throw 'Could not read GitHub releases' }
 
