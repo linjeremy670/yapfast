@@ -362,9 +362,7 @@ jobs:
         env:
           CURRENT_TAG: ${{ steps.publish.outputs.tag }}
         run: |
-          $rows = @(gh api --paginate \
-            "repos/$env:YAPFAST_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | [.tag_name, .published_at, ([.assets[].name] | join(","))] | @tsv')
+          $rows = @(gh api --paginate "repos/$env:YAPFAST_REPOSITORY/releases?per_page=100" --jq '.[] | [.tag_name, .published_at, ([.assets[].name] | join(","))] | @tsv')
           if ($LASTEXITCODE -ne 0) { throw 'Could not list releases for cleanup' }
           $complete = @(
             foreach ($line in $rows) {
