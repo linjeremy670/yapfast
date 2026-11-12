@@ -2,6 +2,15 @@ name: Sync Upstream & Build Windows
 
 on:
   workflow_call:
+    inputs:
+      force_build:
+        type: boolean
+        default: false
+    secrets:
+      YAPFAST_TOKEN:
+        required: true
+      DISCORD_WEBHOOK_URL:
+        required: false
   workflow_dispatch:
     inputs:
       force_build:
@@ -28,11 +37,15 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: automation/windows-build
+          token: ${{ secrets.YAPFAST_TOKEN }}
           fetch-depth: 0
 
       - name: Sync upstream without rewriting fork history
         shell: pwsh
+        env:
+          YAPFAST_TOKEN: ${{ secrets.YAPFAST_TOKEN }}
         run: |
+          git remote set-url origin "https://x-access-token:$env:YAPFAST_TOKEN@github.com/$env:GITHUB_REPOSITORY.git"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote add upstream https://github.com/yapfast/yapfast.git
@@ -69,7 +82,7 @@ jobs:
         id: check
         shell: pwsh
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.YAPFAST_TOKEN }}
           FORCE_BUILD: ${{ inputs.force_build }}
         run: |
           $sha = (git rev-parse HEAD).Trim()
@@ -98,7 +111,7 @@ jobs:
     if: needs.sync.outputs.should_build == 'true'
     runs-on: windows-2025
     env:
-      GH_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ secrets.YAPFAST_TOKEN }}
       BUILD_SHA: ${{ needs.sync.outputs.sha }}
 
     steps:
