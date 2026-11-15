@@ -27,7 +27,8 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       GH_REPO: linjeremy670/yapfast
       YAPFAST_REPOSITORY: linjeremy670/yapfast
@@ -108,6 +109,7 @@ jobs:
     needs: sync
     if: needs.sync.outputs.should_build == 'true'
     runs-on: windows-latest
+    timeout-minutes: 90
     env:
       GH_REPO: linjeremy670/yapfast
       YAPFAST_REPOSITORY: linjeremy670/yapfast
