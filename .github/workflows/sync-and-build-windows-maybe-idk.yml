@@ -298,11 +298,11 @@ jobs:
           git fetch origin --tags
           if ($LASTEXITCODE -ne 0) { throw 'Could not fetch release tags' }
 
-          $tags = @(gh release list --limit 100 --json tagName --jq '.[].tagName')
-          if ($LASTEXITCODE -ne 0) { throw 'Could not find previous releases' }
-          $previous = $tags |
-            Where-Object { $_ -match '^windows-[0-9a-f]{40}-\d+-\d+$' } |
-            Select-Object -First 1
+          $releaseRows = @(gh api --paginate "repos/$env:YAPFAST_REPOSITORY/releases?per_page=100" `
+            --jq '.[] | select(.tag_name | test("^windows-[0-9a-f]{40}-[0-9]+-[0-9]+$")) | select((([.assets[].name] | index("yapfast-windows-x64.exe")) != null) and (([.assets[].name] | index("SHA256SUMS")) != null)) | [.published_at, .tag_name] | @tsv')
+          if ($LASTEXITCODE -ne 0) { throw 'Could not list previous complete releases' }
+          $previousRow = $releaseRows | Sort-Object -Descending | Select-Object -First 1
+          $previous = if ($previousRow) { ($previousRow -split "`t", 2)[1] } else { $null }
 
           if ($previous) {
             $changes = @(git log -n 60 --format='- %h %s' "$previous..HEAD")
