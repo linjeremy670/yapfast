@@ -91,10 +91,9 @@ jobs:
           $matching = @($tags | Where-Object { $_ -match "^windows-$sha-\d+-\d+$" })
           $released = $false
           foreach ($tag in $matching) {
-            $asset = gh release view $tag --json assets `
-              --jq '[.assets[].name] | index("yapfast-windows-x64.exe") != null'
+            $assets = @(gh release view $tag --json assets --jq '.assets[].name')
             if ($LASTEXITCODE -ne 0) { throw "Could not inspect release $tag" }
-            if ($asset.Trim() -eq 'true') {
+            if ('yapfast-windows-x64.exe' -in $assets -and 'SHA256SUMS' -in $assets) {
               $released = $true
               break
             }
