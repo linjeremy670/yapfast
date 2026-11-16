@@ -6,6 +6,9 @@ on:
       force_build:
         type: boolean
         default: false
+      enable_sccache:
+        type: boolean
+        default: false
     secrets:
       YAPFAST_TOKEN:
         required: true
@@ -15,6 +18,10 @@ on:
     inputs:
       force_build:
         description: Build even if the current commit was already released
+        type: boolean
+        default: false
+      enable_sccache:
+        description: Experimental compiler cache benchmark (use with force_build)
         type: boolean
         default: false
 
@@ -163,6 +170,9 @@ jobs:
           shared-key: windows-release
           key: windows-latest
           cache-on-failure: true
+          cache-bin: false
+          cache-workspace-crates: true
+          cache-targets: ${{ !inputs.enable_sccache }}
 
       - name: Restore cached LLVM 21 installation
         if: steps.gate.outputs.should_build == 'true'
@@ -248,10 +258,19 @@ jobs:
           if (-not (Test-Path $archivePath)) { throw 'Skia archive is missing' }
           "SKIA_BINARIES_URL=$archiveUrl" >> $env:GITHUB_ENV
 
+      - name: Set up optional sccache compiler cache
+        if: steps.gate.outputs.should_build == 'true' && inputs.enable_sccache
+        id: sccache_setup
+        uses: mozilla-actions/sccache-action@v0.0.11
+        continue-on-error: true
+
       - name: Build release binary
         if: steps.gate.outputs.should_build == 'true'
         id: cargo_build
         shell: pwsh
+        env:
+          RUSTC_WRAPPER: ${{ inputs.enable_sccache && steps.sccache_setup.outcome == 'success' && 'sccache' || '' }}
+          SCCACHE_GHA_ENABLED: 'true'
         run: |
           $started = [DateTime]::UtcNow
           cargo build --release --locked
@@ -259,6 +278,21 @@ jobs:
           $seconds = [int]([DateTime]::UtcNow - $started).TotalSeconds
           "seconds=$seconds" >> $env:GITHUB_OUTPUT
           "### Cargo compilation: $seconds seconds" >> $env:GITHUB_STEP_SUMMARY
+
+      - name: Report compiler cache efficiency
+        if: always() && steps.gate.outputs.should_build == 'true' && steps.sccache_setup.outcome == 'success'
+        shell: pwsh
+        run: |
+          $stats = (& sccache --show-stats | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'sccache statistics unavailable'
+            exit 0
+          }
+          Write-Host $stats
+          "### sccache statistics" >> $env:GITHUB_STEP_SUMMARY
+          ([char]96 * 3) >> $env:GITHUB_STEP_SUMMARY
+          $stats >> $env:GITHUB_STEP_SUMMARY
+          ([char]96 * 3) >> $env:GITHUB_STEP_SUMMARY
 
       - name: Package executable and checksum
         if: steps.gate.outputs.should_build == 'true'
@@ -337,7 +371,8 @@ jobs:
             "- Comparison: $referenceSeconds s ($referenceLabel)",
             "- Time saved: $savedSeconds s ($savedPercent percent)",
             "- Skia cache hit: ${{ steps.skia_cache.outputs.cache-hit }}",
-            "- Cargo cache hit: ${{ steps.cargo_cache.outputs.cache-hit }}",
+            "- Cargo cache exact-key hit (partial restores possible): ${{ steps.cargo_cache.outputs.cache-hit }}",
+            "- sccache enabled: ${{ inputs.enable_sccache }}",
             "- LLVM cache hit: ${{ steps.llvm_cache.outputs.cache-hit }}",
             "- Rust compiler: $rustVersion",
             "- Executable SHA256: $binaryHash"
