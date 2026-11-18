@@ -303,7 +303,7 @@ jobs:
               sort -r
           )
           retained=()
-          for row in "${{ releases[@]:0:3 }"; do
+          for row in "${releases[@]:0:3}"; do
             retained+=("${row#*$'\t'}")
           done
           if [[ -n "$CURRENT_TAG" ]] && [[ ! " ${retained[*]} " =~ " $CURRENT_TAG " ]]; then
