@@ -354,8 +354,8 @@ jobs:
           if [[ "$status" == "success" && -n "$RELEASE_TAG" ]]; then
             url="https://github.com/$YAPFAST_REPOSITORY/releases/tag/$RELEASE_TAG"
           fi
-          cargo_hit='${{ steps.cargo_cache.outputs.cache-hit }'
-          xwin_hit='${{ steps.xwin_cache.outputs.cache-hit }'
+          cargo_hit="${CARGO_CACHE_HIT:-unavailable}"
+          xwin_hit="${XWIN_CACHE_HIT:-unavailable}"
           message="Yapfast Windows build **$status_label** for $short_sha: $url | Cargo cache: $cargo_hit | cargo-xwin cache: $xwin_hit"
           payload="$(jq -n --arg content "$message" '{content:$content,allowed_mentions:{parse:[]}}')"
           curl --fail --silent --show-error --max-time 10 \
