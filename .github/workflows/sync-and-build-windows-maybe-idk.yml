@@ -306,7 +306,7 @@ jobs:
           for row in "${releases[@]:0:3}"; do
             retained+=("${row#*$'\t'}")
           done
-          if [[ -n "$CURRENT_TAG" ]] && [[ ! " ${retained[*]} " =~ " $CURRENT_TAG " ]]; then
+          if [[ -n "$CURRENT_TAG" && " ${retained[*]} " != *" $CURRENT_TAG "* ]]; then
             retained=("$CURRENT_TAG" "${retained[@]:0:2}")
           fi
           for row in "${releases[@]}"; do
@@ -341,7 +341,7 @@ jobs:
             echo "Discord webhook is not configured; notification skipped."
             exit 0
           fi
-          status='${{ job.status }'
+          status='${{ job.status }}'
           status_label="$(printf '%s' "$status" | tr '[:lower:]' '[:upper:]')"
           short_sha="$(printf '%s' "$BUILD_SHA" | cut -c1-8)"
           url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
