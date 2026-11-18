@@ -239,6 +239,9 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.YAPFAST_TOKEN }}
+          CARGO_CACHE_HIT: ${{ steps.cargo_cache.outputs.cache-hit }}
+          XWIN_CACHE_HIT: ${{ steps.xwin_cache.outputs.cache-hit }}
+          ENABLE_SCCACHE: ${{ inputs.enable_sccache }}
         run: |
           set -euo pipefail
           previous="$(gh api --paginate "repos/$YAPFAST_REPOSITORY/releases?per_page=100" \
@@ -263,9 +266,9 @@ jobs:
             echo
             echo "## Build diagnostics"
             echo
-            echo "- Cargo cache exact-key hit: ${{ steps.cargo_cache.outputs.cache-hit }}"
-            echo "- cargo-xwin Windows SDK cache hit: ${{ steps.xwin_cache.outputs.cache-hit }}"
-            echo "- Optional sccache enabled: ${{ inputs.enable_sccache }}"
+            echo "- Cargo cache exact-key hit: $CARGO_CACHE_HIT"
+            echo "- cargo-xwin Windows SDK cache hit: $XWIN_CACHE_HIT"
+            echo "- Optional sccache enabled: $ENABLE_SCCACHE"
             echo "- LLVM and prepared-Skia caches: not used by upstream's current Nix cross-build"
             echo "- Rust compiler: $rust_version"
             echo "- Executable SHA256: $binary_hash"
@@ -335,13 +338,16 @@ jobs:
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           RELEASE_TAG: ${{ steps.publish.outputs.tag }}
+          JOB_STATUS: ${{ job.status }}
+          CARGO_CACHE_HIT: ${{ steps.cargo_cache.outputs.cache-hit }}
+          XWIN_CACHE_HIT: ${{ steps.xwin_cache.outputs.cache-hit }}
         run: |
           set -euo pipefail
           if [[ -z "$DISCORD_WEBHOOK_URL" ]]; then
             echo "Discord webhook is not configured; notification skipped."
             exit 0
           fi
-          status='${{ job.status }}'
+          status="$JOB_STATUS"
           status_label="$(printf '%s' "$status" | tr '[:lower:]' '[:upper:]')"
           short_sha="$(printf '%s' "$BUILD_SHA" | cut -c1-8)"
           url="https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
