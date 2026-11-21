@@ -183,7 +183,7 @@ pub fn update(app: &mut App, event: Event) -> Task<Message> {
         // with the selected room, the forum's for its post.
         Event::Clipboard(Writing::Draft | Writing::NewPost, Some(files)) => {
             app.client.dispatch(Action::Stage(files));
-            app.sync()
+            Task::batch([app.sync(), crate::composer::refocus(app)])
         }
         Event::Clipboard(Writing::NewThread, Some(files)) | Event::ChosenFirst(files) => {
             if !files.is_empty() {
