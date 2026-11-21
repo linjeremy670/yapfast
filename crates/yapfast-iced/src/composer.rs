@@ -983,11 +983,12 @@ fn composer_box<'a>(ctx: crate::ctx::Ctx<'a>, look: &Look) -> Element<'a, Messag
     } else {
         10.0.into()
     };
-    let mut inside = column![];
-    if let Some(tray) = crate::uploads::tray(ctx) {
-        inside = inside.push(tray);
-    }
-    let frame = container(inside.push(line))
+    // Keep the upload tray's slot even when empty. Otherwise adding the
+    // first attachment shifts the field in iced's widget tree, losing its
+    // focus state and visible caret.
+    let tray = crate::uploads::tray(ctx)
+        .unwrap_or_else(|| Space::new().height(0).into());
+    let frame = container(column![tray, line])
         .width(Length::Fill)
         .style(move |_| crate::style::outlined(ground, edge, radius));
     Popover::new(
